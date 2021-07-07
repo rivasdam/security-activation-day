@@ -1,0 +1,398 @@
+Description: This cloudformation creates the environment for the Macie Customer Workshop.  It is designed to run only in us-east-1.
+Parameters:
+#An email address is required for the SNS topic
+  EmailAddress:
+    Type: String
+    Description: Enter a valid email address for the SNS notification delivery
+    AllowedPattern: '[0-9A-Za-z.\\-_+]+@[0-9A-Za-z.]+'
+    ConstraintDescription: Enter a valid email address
+
+#SNS topic to publish remediation emails
+Resources:
+  SnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "macie_remediation_notification"
+      Subscription:
+        - Endpoint: 
+            Ref: EmailAddress
+          Protocol: email
+
+#Role for the remediation lambda to run
+  RemediationEventLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: "Role for event create Lamda to execute"
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - 
+            Effect: "Allow"
+            Principal: 
+              Service: 
+                - "lambda.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: "lambda_execution_role"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action: 
+                  - "kms:Decrypt"
+                  - "kms:Encrypt"
+                  - "kms:ReEncrypt*"
+                  - "kms:GenerateDataKey*"
+                  - "kms:DescribeKey"
+                Resource: !GetAtt ConfidentialKey.Arn 
+        - PolicyName: "sns_publish_role"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action: 
+                  - "sns:Publish"
+                Resource: !Ref SnsTopic        
+
+#Role to allow the content copy lambda to run
+  FileCopyLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: "Role for event create Lamda to execute"
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - 
+            Effect: "Allow"
+            Principal: 
+              Service: 
+                - "lambda.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: "lambda_execution_role"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action: 
+                  - "kms:Decrypt"
+                  - "kms:Encrypt"
+                  - "kms:ReEncrypt*"
+                  - "kms:GenerateDataKey*"
+                  - "kms:DescribeKey"
+                Resource: !GetAtt ConfidentialKey.Arn
+
+#Custom function to copy the files into S3 buckets and generate S3 policy alerts
+  MacieCustom:
+    Type: Custom::MacieInstaller
+    Properties:
+      ServiceToken: !GetAtt FileCopyLambdaFunction.Arn
+      BUCKETP: !Ref PublicBucket
+      BUCKETI: !Ref InternalBucket
+      BUCKETC: !Ref ConfidentialBucket
+      BUCKETD: !Ref DemoBucket
+      BUCKETS: 'macie-security-workshop-us-east-1'
+
+#Lambda layer to support new boto3 client for including Macie2 and Request python library
+  ResultsLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python3.7
+      Content:
+        S3Bucket: 'macie-security-workshop-us-east-1'
+        S3Key: boto3-layer.zip
+      LayerName: boto3-layer
+      Description: 'Adds support for python results library'
+
+#This lambda actually copies the data from a public S3 bucket to the lab S3 buckets
+#Stored in a S3 public S3 bucket
+  FileCopyLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: 'Copy data to S3 buckets'
+      Handler: 'MacieWorkshopCustomLambda.handler'
+      Layers:
+        - !Ref ResultsLayer
+      Role: !GetAtt FileCopyLambdaRole.Arn
+      Code:
+        S3Bucket: 'macie-security-workshop-us-east-1'
+        S3Key: 'MacieWorkshopCustomLambda.zip'
+      Runtime: 'python3.7' 
+      Timeout: '30' 
+
+#This lambda excutes the remediation function in the lab
+  RemediationLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "Remediate incorrectly tagged and stored S3 files"
+      Handler: index.handler
+      Role: !GetAtt RemediationEventLambdaRole.Arn
+      Runtime: 'python3.7'
+      Timeout: '30'
+      Environment: 
+        Variables:
+          SECURE_BUCKET: !Ref ConfidentialBucket
+          TOPIC_ARN: !Ref SnsTopic
+          SECURE_TAG_VALUE: 'Confidential'
+      Code: 
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import string
+          import random
+          secureBucket = os.environ['SECURE_BUCKET']
+          snsTopicArn = os.environ['TOPIC_ARN']
+          stV = os.environ['SECURE_TAG_VALUE']
+
+          snsc = boto3.client('sns')
+          s3c = boto3.client('s3')
+
+          def getRandom(stringLength=10):
+              lettersAndDigits = string.ascii_lowercase + string.digits
+              return ''.join((random.choice(lettersAndDigits) for i in range(stringLength)))
+
+          def handler(event, context):
+              
+              accountId = event['account']
+              tagKey = event['detail']['resourcesAffected']['s3Object']['tags'][0]['key'] 
+              tagValue = event['detail']['resourcesAffected']['s3Object']['tags'][0]['value'] 
+              encryptionTypeFile = event['detail']['resourcesAffected']['s3Object']['serverSideEncryption']['encryptionType'] 
+              encryptionTypeBucket = event['detail']['resourcesAffected']['s3Bucket']['defaultServerSideEncryption']['encryptionType']
+              bkN = event['detail']['resourcesAffected']['s3Bucket']['name']
+              feN = event['detail']['resourcesAffected']['s3Object']['key']
+              dataIdentifiersTriggered = event['detail']['classificationDetails']['result']['customDataIdentifiers']['detections'][0]['name']
+              
+              sbT = "Sensitive Data has been discoved in a bucket that is not correctly tagged or classified."
+              msT = "Sensitive Data has been discoved in a bucket that belongs to "+accountId+" that is not correctly tagged or classified.\n\nThis has been remediated automatically:\n\n"
+              msT = msT + 'The filename is: '+feN+'\n'
+              msT = msT + 'It was located in bucket: '+bkN+'\n'
+              msT = msT + 'It was found by '+dataIdentifiersTriggered+'\n'
+              msT = msT + 'This means it contains sensitive project data and must be protected.\n\n'
+              msT = msT + 'This is out of compliance with our data protection standards\n'
+              msT = msT + '- The '+tagKey+' tag is '+tagValue+' and it should be '+stV+'\n'
+              msT = msT + '- The bucket encryption is '+encryptionTypeBucket+' and it needs to be AWS:KMS\n'
+              msT = msT + '- The file encryption is '+encryptionTypeFile+' and it needs to be AWS:KMS\n'
+              msT = msT + 'The file has been moved to '+secureBucket+'\n'
+
+              #copy the object to the secure holding bucket
+              copySource = { 'Bucket': bkN, 'Key':feN }
+              try:
+                  response = s3c.copy(copySource, secureBucket, feN)
+                  response = s3c.delete_object(Bucket=bkN,Key=feN)
+                  response = s3c.put_object_tagging(Bucket=secureBucket,Key=feN,Tagging={'TagSet': [{'Key':'Classification','Value':stV},]})    
+
+                  tmpFn = '/tmp/'+getRandom(20)
+                  f = open(tmpFn, 'w')
+                  f.write("Moved to s3://"+secureBucket+"/"+feN)
+                  f.close
+                  with open(tmpFn, 'rb') as f:
+                      response = s3c.upload_fileobj(f, bkN, feN)
+              except Exception as e:
+                  print(e)
+              # Notify the administrator
+              response = snsc.publish(
+                  TopicArn=snsTopicArn,
+                  Message=msT,
+                  Subject=sbT
+                  )
+
+              return {
+                  'statusCode': 200,
+              }    
+
+#Five S3 buckets created for the lab
+  ConfidentialBucket:
+    DependsOn: ConfidentialKey
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration: 
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: aws:kms
+            KMSMasterKeyID:  !GetAtt ConfidentialKey.Arn
+      Tags:
+        - Key: "Classification"
+          Value: "Confidential"
+
+  PublicBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      Tags:
+        - Key: "Classification"
+          Value: "Public"
+
+  InternalBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: "Classification"
+          Value: "Internal"    
+
+  DemoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256 
+
+  ResultsBucket:
+    DependsOn: ResultsKey
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration: 
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: aws:kms
+            KMSMasterKeyID:  !GetAtt ResultsKey.Arn
+
+#Create two keys, one for the results bucket and one to ecrypt the confidential lab bucket
+#Each key is created and named with an alias           
+  ConfidentialKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: 
+        Fn::Join:
+        - ''
+        - - 'alias/'
+          - Ref: AWS::StackName
+          - '-confidential-bucket-encryption-key'
+      TargetKeyId:
+        Ref: ConfidentialKey
+
+  ResultsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: "Key for results bucket"
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-1
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: 
+                Fn::Join:
+                - ''
+                - - 'arn:aws:iam::'
+                  - Ref: AWS::AccountId
+                  - :root            
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow Macie Principal to use the key
+            Effect: Allow
+            Principal:
+              Service: "macie.amazonaws.com"
+            Action:
+              - kms:Encrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+
+  ResultsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: 
+        Fn::Join:
+        - ''
+        - - 'alias/'
+          - Ref: AWS::StackName
+          - '-results-bucket-encryption-key'
+      TargetKeyId:
+        Ref: ResultsKey
+
+  ConfidentialKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: "Key for confidential bucket"
+      Tags:
+        - Key:  "Classification"
+          Value: "Confidential"
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-2
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: 
+                Fn::Join:
+                - ''
+                - - 'arn:aws:iam::'
+                  - Ref: AWS::AccountId
+                  - :root            
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow Macie Service Role to use the key
+            Effect: Allow
+            Principal:
+              AWS: 
+                Fn::Join:
+                - ''
+                - - 'arn:aws:iam::'
+                  - Ref: AWS::AccountId
+                  - :role/aws-service-role/macie.amazonaws.com/AWSServiceRoleForAmazonMacie
+            Action:
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey
+            Resource: '*'
+
+#Policy to allow Macie to publish extended results to the Results bucket            
+  ResultsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ResultsBucket
+      PolicyDocument:
+        Statement: 
+          - 
+            Action: 
+              - "s3:GetBucketLocation"
+            Effect: "Allow"
+            Principal: 
+              Service: "macie.amazonaws.com"
+            Resource: !GetAtt ResultsBucket.Arn        
+          - 
+            Action: 
+              - "s3:PutObject"
+            Effect: "Allow"
+            Principal:
+              Service: "macie.amazonaws.com"
+            Resource: 
+              Fn::Join:
+                - ''
+                - - !GetAtt ResultsBucket.Arn 
+                  - '/*'
+          - 
+            Action: 
+              - "s3:*"
+            Effect: "Deny"
+            Principal: '*'
+            Resource:
+              Fn::Join:
+                - ''
+                - - !GetAtt ResultsBucket.Arn 
+                  - '/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
